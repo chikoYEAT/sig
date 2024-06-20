@@ -5,7 +5,7 @@ const sig = @import("../lib.zig");
 const bincode = sig.bincode;
 
 const ArrayList = std.ArrayList;
-const HashMap = std.AutoHashMap;
+const HashMap = std.AutoArrayHashMap;
 const ZstdReader = zstd.Reader;
 
 const Account = sig.core.account.Account;
@@ -657,15 +657,24 @@ const Result = union(enum) {
     Error: TransactionError,
 };
 
-const Status = HashMap(Hash, struct { i: usize, j: ArrayList(struct {
-    key_slice: [CACHED_KEY_SIZE]u8,
-    result: Result,
-}) });
+pub const Status = struct {
+    i: usize,
+    j: []const KeySliceResult,
 
-const BankSlotDelta = struct { slot: Slot, is_root: bool, status: Status };
+    pub const KeySliceResult = struct {
+        key_slice: [CACHED_KEY_SIZE]u8,
+        result: Result,
+    };
+};
+pub const HashStatusMap = HashMap(Hash, Status);
+pub const BankSlotDelta = struct {
+    slot: Slot,
+    is_root: bool,
+    status: HashStatusMap,
+};
 
 pub const StatusCache = struct {
-    bank_slot_deltas: ArrayList(BankSlotDelta),
+    bank_slot_deltas: []const BankSlotDelta,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !StatusCache {
         var status_cache_file = try std.fs.cwd().openFile(path, .{});
@@ -680,8 +689,8 @@ pub const StatusCache = struct {
         return status_cache;
     }
 
-    pub fn deinit(self: *StatusCache) void {
-        bincode.free(self.bank_slot_deltas.allocator, self.*);
+    pub fn deinit(self: StatusCache, allocator: std.mem.Allocator) void {
+        bincode.free(allocator, self);
     }
 
     /// [verify_slot_deltas](https://github.com/anza-xyz/agave/blob/ed500b5afc77bc78d9890d96455ea7a7f28edbf9/runtime/src/snapshot_bank_utils.rs#L709)
@@ -692,7 +701,7 @@ pub const StatusCache = struct {
         slot_history: *const SlotHistory,
     ) !void {
         // status cache validation
-        const len = self.bank_slot_deltas.items.len;
+        const len = self.bank_slot_deltas.len;
         if (len > MAX_CACHE_ENTRIES) {
             return error.TooManyCacheEntries;
         }
@@ -700,7 +709,7 @@ pub const StatusCache = struct {
         var slots_seen = std.AutoArrayHashMap(Slot, void).init(allocator);
         defer slots_seen.deinit();
 
-        for (self.bank_slot_deltas.items) |slot_delta| {
+        for (self.bank_slot_deltas) |slot_delta| {
             if (!slot_delta.is_root) {
                 return error.NonRootSlot;
             }
@@ -983,7 +992,7 @@ pub const AllSnapshotFields = struct {
             // only keep slots > full snapshot slot
             if (!(slot > full_slot)) {
                 incremental_entry.value_ptr.deinit();
-                _ = storages_map.remove(slot);
+                _ = storages_map.swapRemove(slot);
                 continue;
             }
 
@@ -1079,9 +1088,9 @@ test "core.accounts_db.snapshotss: parse status cache" {
 
     const status_cache_path = "test_data/status_cache";
     var status_cache = try StatusCache.init(allocator, status_cache_path);
-    defer status_cache.deinit();
+    defer status_cache.deinit(allocator);
 
-    try std.testing.expect(status_cache.bank_slot_deltas.items.len > 0);
+    try std.testing.expect(status_cache.bank_slot_deltas.len > 0);
 }
 
 test "core.accounts_db.snapshotss: parse snapshot fields" {
