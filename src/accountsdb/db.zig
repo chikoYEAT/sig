@@ -237,10 +237,10 @@ pub const AccountsDB = struct {
     /// loads the account files and gernates the account index from a snapshot
     pub fn loadFromSnapshot(
         self: *Self,
-        // fields from the snapshot
+        /// fields from the snapshot
         fields: AccountsDbFields,
-        // where the account files are
-        accounts_path: []const u8,
+        /// where the account files are
+        accounts_dir: std.fs.Dir,
         n_threads: u32,
         per_thread_allocator: std.mem.Allocator,
     ) !void {
@@ -252,9 +252,8 @@ pub const AccountsDB = struct {
         var timer = std.time.Timer.start() catch unreachable;
         timer.reset();
 
-        // read the account files
-        var accounts_dir = try std.fs.cwd().openDir(accounts_path, .{ .iterate = true });
-        defer accounts_dir.close();
+        const accounts_path = try accounts_dir.realpathAlloc(self.allocator, ".");
+        defer self.allocator.free(accounts_path);
 
         const accounts_dir_iter = accounts_dir.iterate();
 
@@ -645,7 +644,7 @@ pub const AccountsDB = struct {
             }
         }
 
-        var largest_account_file_rw = file_map.get(self.largest_file_id).?;
+        const largest_account_file_rw = file_map.getPtr(self.largest_file_id).?;
         const largest_slot = largest_account_file_rw.readField("slot");
         self.largest_root_slot.store(largest_slot, .unordered);
     }
@@ -2029,6 +2028,68 @@ pub const AccountsDB = struct {
         return biggest;
     }
 
+    /// TODO: a number of these parameters are temporary stand-ins for data that will be derived from the state
+    /// of AccountsDB, which currently doesn't all exist.
+    pub fn writeSnapshotTarTo(
+        /// Although this is a mutable pointer, this method performs no mutations;
+        /// the mutable reference is simply needed in order to obtain a lock on some
+        /// fields.
+        self: *Self,
+        /// `std.io.GenericWriter(...)` | `std.io.AnyWriter`
+        archive_writer: anytype,
+        status_cache: StatusCache,
+        bank_fields: sig.accounts_db.snapshots.BankFields,
+        bank_fields_inc: sig.accounts_db.snapshots.BankFields.Incremental,
+        lamports_per_signature: u64,
+        bank_hash_info: sig.accounts_db.snapshots.BankHashInfo,
+    ) !void {
+        const file_map, var file_map_lg = self.file_map.readWithLock();
+        defer file_map_lg.unlock();
+
+        const slot: Slot = self.largest_root_slot.load(.monotonic);
+        const version = sig.version.CURRENT_CLIENT_VERSION;
+
+        const account_file_infos_buf = try self.allocator.alloc(AccountFileInfo, file_map.count());
+        defer self.allocator.free(account_file_infos_buf);
+
+        var serializable_file_map = std.AutoArrayHashMap(Slot, []const AccountFileInfo).init(self.allocator);
+        defer serializable_file_map.deinit();
+        try serializable_file_map.ensureTotalCapacity(file_map.count());
+
+        for (file_map.values(), account_file_infos_buf) |*value_guarded, *info| {
+            const acc_file, var value_lg = value_guarded.readWithLock();
+            defer value_lg.unlock();
+
+            if (acc_file.slot < slot) continue;
+
+            info.* = .{
+                .id = acc_file.id,
+                .length = acc_file.memory.len,
+            };
+
+            serializable_file_map.putAssumeCapacityNoClobber(acc_file.slot, info[0..1]);
+        }
+
+        const snapshot_fields: SnapshotFields = .{
+            .bank_fields = bank_fields,
+            .accounts_db_fields = .{
+                .file_map = serializable_file_map,
+
+                .stored_meta_write_version = 601,
+
+                .slot = slot,
+                .bank_hash_info = bank_hash_info,
+
+                .rooted_slots = .{},
+                .rooted_slot_hashes = .{},
+            },
+            .lamports_per_signature = lamports_per_signature,
+            .bank_fields_inc = bank_fields_inc,
+        };
+
+        try writeSnapshotTar(archive_writer, version, status_cache, snapshot_fields, file_map);
+    }
+
     inline fn lessThanIf(
         slot: Slot,
         max_slot: ?Slot,
@@ -2136,7 +2197,7 @@ pub fn writeSnapshotTar(
     version: ClientVersion,
     status_cache: StatusCache,
     snapshot_fields: SnapshotFields,
-    storage: AccountStorage,
+    file_map: *const FileMap,
 ) !void {
     const slot: Slot = snapshot_fields.bank_fields.slot;
 
@@ -2158,25 +2219,35 @@ pub fn writeSnapshotTar(
     try writeTarHeader(writer, .regular, "snapshots/status_cache", bincode.sizeOf(status_cache, .{}));
     try bincode.write(writer, status_cache, .{});
     try writer.writeByteNTimes(0, paddingBytes(counting_writer_state.bytes_written));
+    counting_writer_state.bytes_written %= 512;
+    std.debug.assert(counting_writer_state.bytes_written == 0);
 
     { // write the manifest
         const manifest = snapshot_fields;
         const manifest_encoded_size = bincode.sizeOf(manifest, .{});
 
-        var str_buf: [std.fmt.count("snapshots/{0d}/{0d}", .{std.math.maxInt(Slot)})]u8 = undefined;
-        try writeTarHeader(writer, .directory, std.fmt.bufPrint(&str_buf, "snapshots/{d}/", .{slot}) catch unreachable, 0);
-        try writeTarHeader(writer, .regular, std.fmt.bufPrint(&str_buf, "snapshots/{0d}/{0d}", .{slot}) catch unreachable, manifest_encoded_size);
+        const dir_name_bounded = sig.utils.fmt.boundedFmt("snapshots/{d}/", .{slot}, .{std.math.maxInt(Slot)}) catch unreachable;
+        try writeTarHeader(writer, .directory, dir_name_bounded.constSlice(), 0);
+
+        const file_name_bounded = sig.utils.fmt.boundedFmt("snapshots/{0d}/{0d}", .{slot}, .{std.math.maxInt(Slot)}) catch unreachable;
+        try writeTarHeader(writer, .regular, file_name_bounded.constSlice(), manifest_encoded_size);
         try bincode.write(writer, manifest, .{});
         try writer.writeByteNTimes(0, paddingBytes(counting_writer_state.bytes_written));
+        counting_writer_state.bytes_written %= 512;
+        std.debug.assert(counting_writer_state.bytes_written == 0);
     }
 
     // create the accounts dir
     try writeTarHeader(writer, .directory, "accounts/", 0);
 
-    for (storage.file_map.keys(), storage.file_map.values()) |file_id, acc_file| {
+    for (file_map.keys(), file_map.values()) |file_id, *acc_file_guarded| {
+        const acc_file, var acc_file_lg = acc_file_guarded.readWithLock();
+        defer acc_file_lg.unlock();
+
         if (acc_file.slot < slot) continue;
-        var name_buf: [std.fmt.count("accounts/{d}.{d}", .{ std.math.maxInt(Slot), std.math.maxInt(FileId.Int) })]u8 = undefined;
-        try writeTarHeader(writer, .regular, std.fmt.bufPrint(&name_buf, "accounts/{d}.{d}", .{ slot, file_id.toInt() }) catch unreachable, acc_file.memory.len);
+
+        const name_bounded = sig.utils.fmt.boundedFmt("accounts/{d}.{d}", .{ slot, file_id.toInt() }, .{ std.math.maxInt(Slot), std.math.maxInt(FileId.Int) }) catch unreachable;
+        try writeTarHeader(writer, .regular, name_bounded.constSlice(), acc_file.memory.len);
         try writer.writeAll(acc_file.memory);
         try writer.writeByteNTimes(0, paddingBytes(counting_writer_state.bytes_written));
         counting_writer_state.bytes_written %= 512;
@@ -2262,6 +2333,95 @@ pub const AccountStorage = struct {
     }
 };
 
+fn testWriteSnapshot(
+    snapshot_dir: std.fs.Dir,
+    slot: Slot,
+) !void {
+    const manifest_path_bounded = sig.utils.fmt.boundedFmt("snapshots/{0}/{0}", .{slot}, .{std.math.maxInt(Slot)}) catch unreachable;
+    const manifest_file = try snapshot_dir.openFile(manifest_path_bounded.constSlice(), .{});
+    defer manifest_file.close();
+
+    {
+        const original_bytes = try manifest_file.readToEndAlloc(std.testing.allocator, 1 << 21);
+        defer std.testing.allocator.free(original_bytes);
+        try manifest_file.seekTo(0);
+
+        const original_fields = try bincode.readFromSlice(std.testing.allocator, SnapshotFields, original_bytes, .{});
+        defer original_fields.deinit(std.testing.allocator);
+
+        const re_bytes = try bincode.writeAlloc(std.testing.allocator, original_fields, .{});
+        defer std.testing.allocator.free(re_bytes);
+
+        const re_fields = try bincode.readFromSlice(std.testing.allocator, SnapshotFields, re_bytes, .{});
+        defer re_fields.deinit(std.testing.allocator);
+
+        const re_bytes2 = try bincode.writeAlloc(std.testing.allocator, re_fields, .{});
+        defer std.testing.allocator.free(re_bytes2);
+
+        try std.testing.expectEqualSlices(u8, re_bytes, re_bytes2);
+    }
+
+    const snap_fields = try SnapshotFields.decodeFromBincode(std.testing.allocator, manifest_file.reader());
+    defer snap_fields.deinit(std.testing.allocator);
+
+    const status_cache_file = try snapshot_dir.openFile("status_cache", .{});
+    defer status_cache_file.close();
+
+    const status_cache = try StatusCache.decodeFromBincode(std.testing.allocator, status_cache_file.reader());
+    defer status_cache.deinit(std.testing.allocator);
+
+    var accounts_db = try AccountsDB.init(std.testing.allocator, .noop, .{});
+    defer accounts_db.deinit(true);
+
+    {
+        var accounts_dir = try snapshot_dir.openDir("accounts", .{ .iterate = true });
+        defer accounts_dir.close();
+        try accounts_db.loadFromSnapshot(snap_fields.accounts_db_fields, accounts_dir, 4, std.testing.allocator);
+    }
+
+    var tmp_dir = try std.fs.cwd().makeOpenPath("tmp", .{ .iterate = true });
+    defer tmp_dir.close();
+
+    const archive_file = try tmp_dir.createFile("snapshot.tar", .{ .read = true });
+    defer archive_file.close();
+
+    try accounts_db.writeSnapshotTarTo(
+        archive_file.writer(),
+        status_cache,
+        snap_fields.bank_fields,
+        snap_fields.bank_fields_inc,
+        snap_fields.lamports_per_signature,
+        snap_fields.accounts_db_fields.bank_hash_info,
+    );
+
+    var actual_snapshot_dir = try tmp_dir.makeOpenPath("output", .{ .iterate = true });
+    defer actual_snapshot_dir.close();
+
+    try archive_file.seekTo(0);
+    try std.tar.pipeToFileSystem(actual_snapshot_dir, archive_file.reader(), .{});
+
+    {
+        try manifest_file.seekTo(0);
+        const expected_manifest_bytes = try manifest_file.readToEndAlloc(std.testing.allocator, 1 << 21);
+        defer std.testing.allocator.free(expected_manifest_bytes);
+
+        const actual_manifest_file = try actual_snapshot_dir.openFile(manifest_path_bounded.constSlice(), .{});
+        defer actual_manifest_file.close();
+
+        const actual_manifest_bytes = try actual_manifest_file.readToEndAlloc(std.testing.allocator, 1 << 21);
+        defer std.testing.allocator.free(actual_manifest_bytes);
+
+        try std.testing.expectEqualSlices(u8, expected_manifest_bytes, actual_manifest_bytes);
+    }
+}
+
+test testWriteSnapshot {
+    var snapshot_dir = try std.fs.cwd().openDir("test_data", .{ .iterate = true });
+    defer snapshot_dir.close();
+    try testWriteSnapshot(snapshot_dir, 10);
+    // try testWriteSnapshot(snapshot_dir, 25);
+}
+
 fn loadTestAccountsDB(allocator: std.mem.Allocator, use_disk: bool) !struct { AccountsDB, AllSnapshotFields } {
     std.debug.assert(builtin.is_test); // should only be used in tests
 
@@ -2286,7 +2446,7 @@ fn loadTestAccountsDB(allocator: std.mem.Allocator, use_disk: bool) !struct { Ac
         true,
     );
 
-    var snapshot_files = try SnapshotFiles.find(allocator, dir_path);
+    var snapshot_files = try SnapshotFiles.find(allocator, dir);
     defer snapshot_files.deinit(allocator);
 
     var snapshots = try AllSnapshotFields.fromFiles(allocator, dir_path, snapshot_files);
@@ -2942,7 +3102,7 @@ pub const BenchmarkAccountsDBSnapshotLoad = struct {
             return 0;
         };
 
-        var snapshot_files = try SnapshotFiles.find(allocator, dir_path);
+        var snapshot_files = try SnapshotFiles.find(allocator, snapshot_dir);
         defer snapshot_files.deinit(allocator);
 
         std.fs.cwd().access(accounts_path, .{}) catch {

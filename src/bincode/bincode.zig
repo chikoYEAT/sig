@@ -102,20 +102,28 @@ pub fn read(allocator: std.mem.Allocator, comptime U: type, reader: anytype, par
             } else if (comptime sig.utils.types.hashMapInfo(T)) |hm_info| {
                 const K = hm_info.Key;
                 const V = hm_info.Value;
-                const len = try bincode.read(allocator, u64, reader, params);
+                const len_u64 = try bincode.read(allocator, u64, reader, params);
+                if (len_u64 > std.math.maxInt(usize)) return error.HashMapTooBig;
+                const len: usize = @intCast(len_u64);
 
                 data = switch (hm_info.management) {
                     .managed => T.init(allocator),
                     .unmanaged => .{},
                 };
                 switch (hm_info.management) {
-                    .managed => try data.ensureTotalCapacity(@intCast(len)),
+                    .managed => try data.ensureTotalCapacity(len),
                     .unmanaged => try data.ensureTotalCapacity(allocator, @intCast(len)),
                 }
                 for (0..len) |_| {
                     const key = try bincode.read(allocator, K, reader, params);
+                    errdefer bincode.free(allocator, key);
+
                     const value = try bincode.read(allocator, V, reader, params);
-                    data.putAssumeCapacity(key, value);
+                    errdefer bincode.free(allocator, value);
+
+                    const gop = data.getOrPutAssumeCapacity(key);
+                    if (gop.found_existing) return error.DuplicateHashMapEntries;
+                    gop.value_ptr.* = value;
                 }
             } else {
                 inline for (info.fields) |field| {
