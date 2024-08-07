@@ -24,5 +24,3 @@ pub const Instruction = transaction.CompiledInstruction;
 pub const Message = transaction.Message;
 pub const MessageHeader = transaction.MessageHeader;
 pub const Transaction = transaction.Transaction;
-
-pub const HASH_SIZE = hash.HASH_SIZE;
